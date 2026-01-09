@@ -40,7 +40,12 @@ def extract_packet_fields(pkt):
         dport = pkt[UDP].dport
 
     ts = float(getattr(pkt, "time", 0.0))
-    return src, dst, sport, dport, proto, ts, is_tcp
+    
+    payload_len = len(pkt[TCP].payload) if pkt.haslayer(TCP) else (len(pkt[UDP].payload) if pkt.haslayer(UDP) else 0)
+    header_len = len(pkt) - payload_len
+    
+    # Return these to the aggregator
+    return src, dst, sport, dport, proto, ts, is_tcp, payload_len, header_len
 
 def process_pcap_to_flows_stream(file_path, idle_timeout=IDLE_TIMEOUT):
     """

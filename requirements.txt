@@ -1,3 +1,6 @@
 scapy
 pandas
 chromadb
+langchain
+langchain-google-genai
+python-dotenv

@@ -9,7 +9,7 @@ sample.pcap
 
 # Local env & secrets
 .env
-local_config.py
+.env.example
 
 # ChromaDB / vector DB persistence (DO NOT push)
 chroma_db/
