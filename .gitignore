@@ -1,6 +1,22 @@
+# Python
 venv/
 __pycache__/
+*.pyc
+
+# PCAPs and local captures
 *.pcap
+sample.pcap
+
+# Local env & secrets
 .env
-parser
 local_config.py
+
+# ChromaDB / vector DB persistence (DO NOT push)
+chroma_db/
+chromadb/
+chroma.sqlite3
+chroma_db.sqlite3
+
+# Editor / OS cruft
+.vscode/
+.DS_Store

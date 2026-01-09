@@ -1,0 +1,17 @@
+[
+    {
+        "id": "T1046",
+        "name": "Network Service Scanning",
+        "description": "Adversaries may attempt to enumerate networked services to find vulnerabilities. This often manifests as many short-lived flows to various ports (SYN scans)."
+    },
+    {
+        "id": "T1498",
+        "name": "Network DoS: Direct Exploitation",
+        "description": "Adversaries may flood a target with ICMP, SYN, or UDP packets to exhaust system resources and deny service to legitimate users."
+    },
+    {
+        "id": "T1071",
+        "name": "Standard Application Layer Protocol",
+        "description": "Adversaries may communicate using standard protocols like HTTP, DNS, or HTTPS to blend in with normal traffic."
+    }
+]
