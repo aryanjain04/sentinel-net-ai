@@ -1,6 +1,6 @@
 # SentinelNet-AI — LLM Network Traffic Analysis (PCAP → Flows → RAG → JSON)
 
-Flow-level network traffic analysis that converts PCAPs into sessionized, bidirectional flows, scores them with interpretable rules + lightweight ML gating, and (optionally) performs RAG + Gemini 1.5 Pro deep analysis to output structured JSON recommendations.
+Flow-level network traffic analysis that converts PCAPs into sessionized, bidirectional flows, scores them with interpretable rules + lightweight ML gating, and (optionally) performs RAG + Gemini deep analysis to output structured JSON recommendations.
 
 ## Features
 
@@ -16,7 +16,7 @@ Flow-level network traffic analysis that converts PCAPs into sessionized, bidire
 2. **Rule scoring** (cheap, explainable)
 3. **ML bouncer** (cheap signal for gating)
 4. **RAG retrieval** (semantic + keyword)
-5. **LLM deep analysis** (Gemini 1.5 Pro) with JSON-only output
+5. **LLM deep analysis** (Gemini) with JSON-only output
 
 ## Quickstart
 
@@ -62,6 +62,9 @@ Environment variables (copy `.env.example` → `.env`):
 
 - `GOOGLE_API_KEY` — Gemini API key
 - `LLM_PROVIDER` — `gemini` (default) or `ollama`
+- `GEMINI_MODEL` — model name (e.g. `gemini-2.0-flash` or `gemini-flash-latest`)
 - `MAX_LLM_CALLS_PER_RUN` — hard budget per run
 - `LLM_MIN_SCORE` — minimum rule score to call LLM (unless ML flags)
 - `IDLE_TIMEOUT` — sessionization timeout
+
+If you hit Gemini quota/rate limits, reduce `MAX_LLM_CALLS_PER_RUN` and/or increase `LLM_MIN_SCORE` so fewer flows trigger deep analysis.

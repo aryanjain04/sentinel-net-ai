@@ -10,6 +10,8 @@ result so the end-to-end demo works offline.
 
 import json
 import os
+import re
+import time
 
 import joblib
 import pandas as pd
@@ -148,22 +150,74 @@ Return ONLY valid JSON (no markdown), with keys:
                 "context_used": context_docs,
             }
 
-        try:
+        max_retries = int(os.getenv("LLM_MAX_RETRIES", "0"))
+        stop_on_rate_limit = (os.getenv("LLM_STOP_ON_RATE_LIMIT", "1").strip().lower() not in ("0", "false", "no"))
+
+        def _extract_retry_after_seconds(message: str) -> float | None:
+            m = re.search(r"Please retry in\s+([0-9.]+)s", message)
+            if m:
+                return float(m.group(1))
+            m = re.search(r"retryDelay'\s*:\s*'([0-9.]+)s'", message)
+            if m:
+                return float(m.group(1))
+            m = re.search(r"retryDelay\"\s*:\s*\"([0-9.]+)s\"", message)
+            if m:
+                return float(m.group(1))
+            return None
+
+        def _is_rate_limited(message: str) -> bool:
+            u = message.upper()
+            return "RESOURCE_EXHAUSTED" in u or "429" in u or "QUOTA" in u
+
+        def _invoke_once():
             response = (prompt | self.llm).invoke({"flow_info": narrative, "context": "\n".join(context_docs)})
             content = (response.content or "").strip()
-            # Defensive cleanup for models that still wrap JSON.
             content = content.replace("```json", "").replace("```", "").strip()
             return json.loads(content)
-        except Exception as e:
-            return {
-                "classification": "Suspicious",
-                "confidence": 0.3,
-                "mitre_techniques": [],
-                "reasoning": f"LLM request failed: {str(e)}",
-                "recommended_actions": [
-                    "Verify whether this connection is expected",
-                    "Check endpoint process/network telemetry",
-                    "Correlate with DNS/HTTP logs if available",
-                ],
-                "context_used": context_docs,
-            }
+
+        attempts = 0
+        while True:
+            try:
+                return _invoke_once()
+            except Exception as e:
+                attempts += 1
+                msg = str(e)
+                retry_after = _extract_retry_after_seconds(msg)
+
+                if _is_rate_limited(msg):
+                    result = {
+                        "classification": "Suspicious",
+                        "confidence": 0.3,
+                        "mitre_techniques": [],
+                        "reasoning": f"LLM rate-limited/quota exhausted: {msg}",
+                        "recommended_actions": [
+                            "Reduce MAX_LLM_CALLS_PER_RUN",
+                            "Raise LLM_MIN_SCORE so fewer flows trigger deep analysis",
+                            "Check Gemini API quota/billing settings",
+                        ],
+                        "context_used": context_docs,
+                        "rate_limited": True,
+                        "retry_after_seconds": retry_after,
+                    }
+                    if stop_on_rate_limit:
+                        return result
+
+                if attempts > max_retries:
+                    return {
+                        "classification": "Suspicious",
+                        "confidence": 0.3,
+                        "mitre_techniques": [],
+                        "reasoning": f"LLM request failed: {msg}",
+                        "recommended_actions": [
+                            "Verify whether this connection is expected",
+                            "Check endpoint process/network telemetry",
+                            "Correlate with DNS/HTTP logs if available",
+                        ],
+                        "context_used": context_docs,
+                    }
+
+                # If we are retrying, do a small bounded sleep. (Don't block the UI for long.)
+                sleep_s = 1.0
+                if retry_after is not None:
+                    sleep_s = min(5.0, max(0.5, float(retry_after)))
+                time.sleep(sleep_s)

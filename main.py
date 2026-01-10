@@ -64,6 +64,14 @@ def run_sentinel(pcap_path: str, idle_timeout: float, max_llm_calls: int, llm_mi
         if not result:
             continue
 
+        if isinstance(result, dict) and result.get("rate_limited"):
+            retry_after = result.get("retry_after_seconds")
+            msg = "LLM quota/rate limit hit; stopping deep analysis early."
+            if retry_after is not None:
+                msg += f" Retry after ~{float(retry_after):.0f}s."
+            print(msg)
+            break
+
         alerts.append(
             {
                 "flow_id": flow.get("flow_id"),

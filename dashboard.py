@@ -50,7 +50,10 @@ def _load_run(run_id: str):
 st.set_page_config(page_title="SentinelNet-AI", layout="wide")
 
 st.title("SentinelNet-AI — LLM Network Traffic Analysis")
-st.caption("Flow-level analysis with rule scoring + cost-aware LLM deep dives (Gemini 1.5 Pro)")
+st.caption("Flow-level analysis with rule scoring + budgeted LLM deep dives")
+
+if "_is_running" not in st.session_state:
+    st.session_state["_is_running"] = False
 
 with st.sidebar:
     st.header("Run Settings")
@@ -69,76 +72,122 @@ tab_analyze, tab_history = st.tabs(["Analyze PCAP", "Browse History"])
 with tab_analyze:
     uploaded = st.file_uploader("Upload a PCAP", type=["pcap", "pcapng"])
 
-    col_a, col_b = st.columns([1, 1])
-    with col_a:
-        run_btn = st.button("Run Analysis", type="primary", use_container_width=True, disabled=uploaded is None)
-    with col_b:
-        st.write("")
+    with st.form("run_form", clear_on_submit=False):
+        col_a, col_b = st.columns([1, 1])
+        with col_a:
+            run_btn = st.form_submit_button(
+                "Run Analysis",
+                type="primary",
+                use_container_width=True,
+                disabled=(uploaded is None or st.session_state["_is_running"]),
+            )
+        with col_b:
+            st.write("")
 
-    if run_btn and uploaded is not None:
+    if run_btn and uploaded is not None and not st.session_state["_is_running"]:
+        st.session_state["_is_running"] = True
         tmp_dir = Path(".tmp")
         tmp_dir.mkdir(exist_ok=True)
         pcap_path = tmp_dir / uploaded.name
         pcap_path.write_bytes(uploaded.getbuffer())
 
-        with st.status("Extracting flows (sessionized + bidirectional)...", expanded=False):
-            flows_df = process_pcap_to_flows_stream(str(pcap_path), idle_timeout=float(idle_timeout))
+        try:
+            with st.status("Extracting flows (sessionized + bidirectional)...", expanded=False):
+                flows_df = process_pcap_to_flows_stream(str(pcap_path), idle_timeout=float(idle_timeout))
 
-        if flows_df.empty:
-            st.warning("No flows extracted from this PCAP.")
-        else:
-            rules = RuleEngine()
-            analyzer = TrafficAnalyzer()
-            gating = LLMGatingPolicy(min_score=float(llm_min_score), max_calls_per_run=int(max_llm_calls))
-
-            scored: list[dict] = []
-            for _, row in flows_df.iterrows():
-                flow = row.to_dict()
-                matches = rules.score_flow(flow)
-                score = aggregate_score(matches)
-                ml_flag = bool(analyzer.ml_bouncer(flow))
-                flow["rule_score"] = float(score)
-                flow["ml_flag"] = bool(ml_flag)
-                flow["rule_matches"] = [m.__dict__ for m in matches]
-                scored.append(flow)
-
-            scored.sort(key=lambda x: (x.get("rule_score", 0.0), x.get("ml_flag", False)), reverse=True)
-
-            with st.status("Deep analysis (LLM) on a budget...", expanded=False):
-                alerts: list[dict] = []
-                for flow in scored:
-                    if not gating.allow(float(flow.get("rule_score", 0.0)), bool(flow.get("ml_flag", False))):
-                        continue
-                    llm_json = analyzer.analyze_flow(flow)
-                    alerts.append({"flow_id": flow.get("flow_id"), "rule_score": flow.get("rule_score"), "ml_flag": flow.get("ml_flag"), "flow": flow, "llm": llm_json})
-
-            run_id = _now_id()
-            run_dir = _save_run(run_id, flows_df, scored, alerts)
-
-            st.success(f"Saved run: {run_dir}")
-
-            st.subheader("Summary")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Flows", len(flows_df))
-            c2.metric("Deep analyses", len(alerts))
-            c3.metric("Max LLM calls", int(max_llm_calls))
-            c4.metric("LLM min score", float(llm_min_score))
-
-            st.subheader("Top suspicious flows")
-            top_df = pd.DataFrame(scored).head(50)
-            st.dataframe(
-                top_df[["flow_id", "server_port", "proto", "duration", "packet_count", "byte_count", "rule_score", "ml_flag"]],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.subheader("LLM outputs")
-            if alerts:
-                for a in alerts:
-                    with st.expander(f"{a['flow_id']} (score={a['rule_score']:.2f}, ml={a['ml_flag']})", expanded=False):
-                        st.json(a["llm"])
+            if flows_df.empty:
+                st.warning("No flows extracted from this PCAP.")
+                st.session_state["_is_running"] = False
             else:
-                st.info("No flows met the deep-analysis criteria.")
+                rules = RuleEngine()
+                analyzer = TrafficAnalyzer()
+                gating = LLMGatingPolicy(min_score=float(llm_min_score), max_calls_per_run=int(max_llm_calls))
+
+                scored: list[dict] = []
+                for _, row in flows_df.iterrows():
+                    flow = row.to_dict()
+                    matches = rules.score_flow(flow)
+                    score = aggregate_score(matches)
+                    ml_flag = bool(analyzer.ml_bouncer(flow))
+                    flow["rule_score"] = float(score)
+                    flow["ml_flag"] = bool(ml_flag)
+                    flow["rule_matches"] = [m.__dict__ for m in matches]
+                    scored.append(flow)
+
+                scored.sort(key=lambda x: (x.get("rule_score", 0.0), x.get("ml_flag", False)), reverse=True)
+
+                alerts: list[dict] = []
+                quota_hit = False
+                retry_after = None
+
+                with st.status("Deep analysis (LLM) on a budget...", expanded=False):
+                    prog = st.progress(0)
+                    eligible = [f for f in scored if gating.allow(float(f.get("rule_score", 0.0)), bool(f.get("ml_flag", False)))]
+
+                    # Reset gating counter because we only used allow() above to preview.
+                    gating = LLMGatingPolicy(min_score=float(llm_min_score), max_calls_per_run=int(max_llm_calls))
+
+                    done = 0
+                    for flow in scored:
+                        if not gating.allow(float(flow.get("rule_score", 0.0)), bool(flow.get("ml_flag", False))):
+                            continue
+
+                        llm_json = analyzer.analyze_flow(flow)
+                        if isinstance(llm_json, dict) and llm_json.get("rate_limited"):
+                            quota_hit = True
+                            retry_after = llm_json.get("retry_after_seconds")
+                            break
+
+                        alerts.append(
+                            {
+                                "flow_id": flow.get("flow_id"),
+                                "rule_score": flow.get("rule_score"),
+                                "ml_flag": flow.get("ml_flag"),
+                                "flow": flow,
+                                "llm": llm_json,
+                            }
+                        )
+
+                        done += 1
+                        denom = max(1, min(len(eligible), int(max_llm_calls)))
+                        prog.progress(min(1.0, done / denom))
+
+                run_id = _now_id()
+                run_dir = _save_run(run_id, flows_df, scored, alerts)
+
+                if quota_hit:
+                    msg = "LLM quota/rate limit hit; stopped deep analysis early."
+                    if retry_after is not None:
+                        msg += f" Try again in ~{float(retry_after):.0f}s."
+                    st.warning(msg)
+
+                st.success(f"Saved run: {run_dir}")
+                st.session_state["_is_running"] = False
+
+                st.subheader("Summary")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Flows", len(flows_df))
+                c2.metric("Deep analyses", len(alerts))
+                c3.metric("Max LLM calls", int(max_llm_calls))
+                c4.metric("LLM min score", float(llm_min_score))
+
+                st.subheader("Top suspicious flows")
+                top_df = pd.DataFrame(scored).head(50)
+                st.dataframe(
+                    top_df[["flow_id", "server_port", "proto", "duration", "packet_count", "byte_count", "rule_score", "ml_flag"]],
+                    width="stretch",
+                    hide_index=True,
+                )
+
+                st.subheader("LLM outputs")
+                if alerts:
+                    for a in alerts:
+                        with st.expander(f"{a['flow_id']} (score={a['rule_score']:.2f}, ml={a['ml_flag']})", expanded=False):
+                            st.json(a["llm"])
+                else:
+                    st.info("No deep-analysis outputs were produced.")
+        finally:
+            st.session_state["_is_running"] = False
 
 
 with tab_history:
@@ -156,7 +205,7 @@ with tab_history:
             top_df = pd.DataFrame(scored)
             st.dataframe(
                 top_df[["flow_id", "server_port", "proto", "duration", "packet_count", "byte_count", "rule_score", "ml_flag"]].head(100),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
