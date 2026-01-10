@@ -1,118 +1,115 @@
+"""CLI entrypoint.
+
+PCAP -> (sessionized bidirectional flows) -> (rules + ML gating) -> (RAG + LLM JSON on a budget)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
 import os
-import sys
+from datetime import datetime
+
 import pandas as pd
-from dotenv import load_dotenv
 
-# Internal modules
-from parser import process_pcap_to_flows_stream
 from analyzer import TrafficAnalyzer
+from detection import LLMGatingPolicy, RuleEngine, aggregate_score
+from parser import process_pcap_to_flows_stream
 
-# Protocol mapping for better narrative
-PROTO_MAP = {
-    6: "TCP",
-    17: "UDP",
-    1: "ICMP"
-}
 
-def get_protocol_name(proto_num):
-    return PROTO_MAP.get(proto_num, str(proto_num))
+def _now_id() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
 
-def heuristic_is_suspicious(flow):
-    """
-    Simple filter to skip obviously benign traffic to save LLM costs.
-    Returns True if flow looks interesting enough to analyze.
-    """
-    # 1. Skip standard DNS traffic to trusted resolvers
-    # (Google DNS, Cloudflare) - assuming low volume
-    trusted_dns = ['8.8.8.8', '8.8.4.4', '1.1.1.1']
-    if (flow['dst_port'] == 53 or flow['src_port'] == 53) and \
-       (flow['dst_ip'] in trusted_dns or flow['src_ip'] in trusted_dns) and \
-       flow['packet_count'] < 10:
-        return False
 
-    # 2. Skip local loopback (unless you want to debug it)
-    if flow['src_ip'] == '127.0.0.1' or flow['dst_ip'] == '127.0.0.1':
-        return False
+def run_sentinel(pcap_path: str, idle_timeout: float, max_llm_calls: int, llm_min_score: float):
+    print("--- SentinelNet-AI: Starting Flow Pipeline ---")
+    print(f"PCAP: {pcap_path}")
 
-    # 3. INTERESTING: High packet count, low duration (flooding)
-    if flow['packet_count'] > 50 and flow['duration'] < 1.0:
-        return True
-    
-    # 4. INTERESTING: Zero byte payload features (often scanning)
-    if flow['byte_count'] == 0 and flow['packet_count'] > 3:
-        return True
-
-    # 5. INTERESTING: Non-standard high ports involved
-    if flow['dst_port'] > 10000 or flow['src_port'] > 10000:
-        return True
-
-    # Default: Analyze it if we aren't sure
-    return True
-
-def main():
-    # 1. Setup
-    load_dotenv()
-    if not os.getenv("GOOGLE_API_KEY"):
-        print("❌ Error: GOOGLE_API_KEY not found in .env file.")
-        print("Please create a .env file with your API key.")
+    if not os.path.exists(pcap_path):
+        print(f"PCAP not found: {pcap_path}")
+        print("Provide a PCAP via --pcap or set PCAP_PATH in .env")
         return
 
-    pcap_file = "sample.pcap"
-    if len(sys.argv) > 1:
-        pcap_file = sys.argv[1]
-
-    if not os.path.exists(pcap_file):
-        print(f"❌ Error: File {pcap_file} not found.")
-        print("Run 'python generate_sample.py' to create a test file.")
+    df = process_pcap_to_flows_stream(pcap_path, idle_timeout=idle_timeout)
+    if df.empty:
+        print("No flows extracted.")
         return
 
-    print(f"🔍 Parsing {pcap_file}...")
-    df_flows = process_pcap_to_flows_stream(pcap_file)
-    print(f"✅ Extracted {len(df_flows)} flows.")
+    analyzer = TrafficAnalyzer()
+    rules = RuleEngine()
+    gating = LLMGatingPolicy(min_score=llm_min_score, max_calls_per_run=max_llm_calls)
 
-    print("🧠 Initializing AI Analyst...")
-    try:
-        analyzer = TrafficAnalyzer()
-    except Exception as e:
-        print(f"❌ Failed to init analyzer: {e}")
-        return
+    alerts: list[dict] = []
+    scored_rows: list[dict] = []
 
-    results = []
-    print("\n🚀 Starting Analysis Pipeline (Heuristic Filter -> RAG -> LLM)\n")
-    
-    for index, row in df_flows.iterrows():
-        # Convert row to dictionary and normalize types
+    # Score all flows first (cheap) so we can prioritize.
+    for _, row in df.iterrows():
         flow = row.to_dict()
-        
-        # Normalize fields for analyzer
-        flow['tcp_flags'] = flow['flags'].split(',') if flow['flags'] else []
-        flow['protocol'] = get_protocol_name(flow['proto'])
-        
-        # Step 1: Heuristic Filter
-        if not heuristic_is_suspicious(flow):
-            print(f"Skipping Flow {index}: {flow['src_ip']} -> {flow['dst_ip']} (Heuristic: Benign)")
+        matches = rules.score_flow(flow)
+        score = aggregate_score(matches)
+        ml_flag = bool(analyzer.ml_bouncer(flow))
+        flow["rule_score"] = float(score)
+        flow["ml_flag"] = bool(ml_flag)
+        flow["rule_matches"] = [m.__dict__ for m in matches]
+        scored_rows.append(flow)
+
+    scored_rows.sort(key=lambda x: (x.get("rule_score", 0.0), x.get("ml_flag", False)), reverse=True)
+
+    for flow in scored_rows:
+        # Deep path is reserved for flows that justify the cost.
+        if not gating.allow(float(flow.get("rule_score", 0.0)), bool(flow.get("ml_flag", False))):
             continue
 
-        print(f"⚡ Analyzing Flow {index}: {flow['src_ip']} -> {flow['dst_ip']} ({flow['protocol']})...")
-        
-        # Step 2: Agentic Analysis
-        analysis = analyzer.analyze_flow(flow)
-        
-        # Print Result
-        score = analysis.get('risk_score', 0)
-        classification = analysis.get('classification', 'Unknown')
-        print(f"   -> Result: [{score}/100] {classification}")
-        print(f"   -> Reasoning: {analysis.get('reasoning')}")
-        print("-" * 50)
-        
-        results.append(analysis)
+        result = analyzer.analyze_flow(flow)
+        if not result:
+            continue
 
-    # Save detailed results
-    if results:
-        pd.DataFrame(results).to_json("analysis_report.json", orient="records", indent=2)
-        print(f"\n✅ Analysis Complete. Full report saved to 'analysis_report.json'.")
-    else:
-        print("\n✅ Analysis Complete. No threats detected.")
+        alerts.append(
+            {
+                "flow_id": flow.get("flow_id"),
+                "src": f"{flow.get('src_ip')}:{flow.get('src_port')}",
+                "dst": f"{flow.get('dst_ip')}:{flow.get('dst_port')}",
+                "server_port": flow.get("server_port"),
+                "duration": flow.get("duration"),
+                "packet_count": flow.get("packet_count"),
+                "byte_count": flow.get("byte_count"),
+                "rule_score": flow.get("rule_score"),
+                "ml_flag": flow.get("ml_flag"),
+                "rule_matches": flow.get("rule_matches"),
+                "llm": result,
+            }
+        )
+        print(f"[DEEP] {result.get('classification','?')} score={flow.get('rule_score'):.2f} {flow.get('flow_id')}")
+
+    run_id = _now_id()
+    os.makedirs("runs", exist_ok=True)
+    run_dir = os.path.join("runs", run_id)
+    os.makedirs(run_dir, exist_ok=True)
+
+    df.to_csv(os.path.join(run_dir, "flows.csv"), index=False)
+    with open(os.path.join(run_dir, "scored_flows.json"), "w", encoding="utf-8") as f:
+        json.dump(scored_rows, f, indent=2)
+    with open(os.path.join(run_dir, "alerts.json"), "w", encoding="utf-8") as f:
+        json.dump(alerts, f, indent=2)
+
+    print(f"\nSaved run: {run_dir}")
+    print(f"Flows: {len(df)} | Deep analyses: {len(alerts)} (budget {max_llm_calls})")
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="SentinelNet-AI: PCAP -> flows -> hybrid detection -> LLM analysis")
+    p.add_argument("--pcap", default=os.getenv("PCAP_PATH", ""), help="Path to a PCAP file")
+    p.add_argument("--idle-timeout", type=float, default=float(os.getenv("IDLE_TIMEOUT", "60")))
+    p.add_argument("--max-llm-calls", type=int, default=int(os.getenv("MAX_LLM_CALLS_PER_RUN", "10")))
+    p.add_argument("--llm-min-score", type=float, default=float(os.getenv("LLM_MIN_SCORE", "0.6")))
+    return p
+
 
 if __name__ == "__main__":
-    main()
+    args = _build_arg_parser().parse_args()
+    run_sentinel(
+        pcap_path=args.pcap,
+        idle_timeout=args.idle_timeout,
+        max_llm_calls=args.max_llm_calls,
+        llm_min_score=args.llm_min_score,
+    )

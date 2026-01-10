@@ -1,101 +1,98 @@
 import chromadb
 import json
 import os
-import numpy as np
 from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer
 
 class HybridKnowledgeBase:
     def __init__(self, db_path="./chroma_db", rules_path="knowledge_base/rules.json"):
         """
         Hybrid Search Engine: Combines Semantic Search (ChromaDB) with Keyword Search (BM25).
-        "Best specific context + Best conceptual match"
+        This provides context for both 'behavior' (vectors) and 'specifics' (keywords).
         """
         self.chroma_client = chromadb.PersistentClient(path=db_path)
+        # Use the same model as the analyzer for mathematical consistency
+        self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
         self.collection = self.chroma_client.get_or_create_collection(name="knowledge_base")
         
-        # Load Data for BM25 (In-Memory Keyword Engine)
         self.documents = []
         self.metadatas = []
+        self.bm25 = None
         
+        # Load Data for BM25 (Keyword Engine)
         if os.path.exists(rules_path):
             with open(rules_path, 'r') as f:
                 data = json.load(f)
                 self.documents = [item['description'] for item in data]
                 self.metadatas = [{"id": item['id'], "name": item['name']} for item in data]
                 
-                # Tokenize for BM25
+                # Tokenize for BM25 keyword matching
                 tokenized_docs = [doc.lower().split(" ") for doc in self.documents]
                 self.bm25 = BM25Okapi(tokenized_docs)
         else:
-            print(f"⚠️ Warning: Rules file not found at {rules_path}. BM25 disabled.")
-            self.bm25 = None
+            print(f"⚠️ Warning: Rules file not found at {rules_path}")
 
-    def ingest_rules(self, rules_path="knowledge_base/rules.json"):
-        # (Same ingestion logic as before, just wrapped)
-        if not os.path.exists(rules_path): return
-        with open(rules_path, 'r') as f:
+    def ensure_ingested(self, json_path="knowledge_base/rules.json"):
+        """Ensures ChromaDB has at least some KB docs."""
+        try:
+            if self.collection.count() == 0:
+                self.ingest_kb(json_path=json_path)
+        except Exception:
+            # If count() is unavailable or DB is read-only, don't hard fail.
+            return
+
+    def ingest_kb(self, json_path="knowledge_base/rules.json"):
+        """Ingests and embeds the MITRE rules into ChromaDB."""
+        if not os.path.exists(json_path): return
+        
+        with open(json_path, 'r') as f:
             data = json.load(f)
         
         docs = [item['description'] for item in data]
         metas = [{"id": item['id'], "name": item['name']} for item in data]
         ids = [item['id'] for item in data]
+        
+        # Generate embeddings locally
+        embeddings = self.embedder.encode(docs).tolist()
 
-        self.collection.add(documents=docs, metadatas=metas, ids=ids)
-        print(f"✅ Ingested {len(ids)} rules into ChromaDB.")
-
-    def search(self, query, top_k=3):
-        """
-        Performs Hybrid Search using Reciprocal Rank Fusion (RRF).
-        """
-        if not self.bm25:
-            # Fallback to pure vector search if BM25 failed
-            results = self.collection.query(query_texts=[query], n_results=top_k)
-            return results['documents'][0] if results['documents'] else []
-
-        # 1. Get Vector Results (Semantic)
-        vector_results = self.collection.query(
-            query_texts=[query], 
-            n_results=top_k * 2 # Fetch more for re-ranking
+        self.collection.upsert(
+            documents=docs,
+            metadatas=metas,
+            ids=ids,
+            embeddings=embeddings
         )
-        # Flatten structure: list of docs
-        vec_docs = vector_results['documents'][0] if vector_results['documents'] else []
+        print(f"Successfully ingested {len(ids)} MITRE techniques.")
 
-        # 2. Get BM25 Results (Keyword)
-        tokenized_query = query.lower().split(" ")
-        bm25_docs = self.bm25.get_top_n(tokenized_query, self.documents, n=top_k * 2)
+    def hybrid_search(self, query, top_k=2):
+        """
+        Performs both Vector and Keyword search, then merges results.
+        """
+        # 1. Semantic Search (Vector)
+        vec_docs = []
+        try:
+            query_emb = self.embedder.encode([query]).tolist()
+            v_results = self.collection.query(query_embeddings=query_emb, n_results=top_k)
+            vec_docs = (v_results.get('documents') or [[]])[0]
+        except Exception:
+            vec_docs = []
 
-        # 3. Reciprocal Rank Fusion (Simple Version)
-        # We value Vector and Keyword matches, prioritizing intersection
-        
-        # Simple Logic: Dedup and return top combined
-        combined_results = []
+        # 2. Keyword Search (BM25)
+        bm25_docs = []
+        if self.bm25 is not None and self.documents:
+            tokenized_query = query.lower().split(" ")
+            bm25_docs = self.bm25.get_top_n(tokenized_query, self.documents, n=top_k)
+
+        # 3. Simple Interleaving (Merging for the LLM)
+        combined = []
         seen = set()
+        for doc_list in [vec_docs, bm25_docs]:
+            for doc in doc_list:
+                if doc not in seen:
+                    combined.append(doc)
+                    seen.add(doc)
         
-        # Interleave results (1 vec, 1 bm25, 1 vec...)
-        max_len = max(len(vec_docs), len(bm25_docs))
-        for i in range(max_len):
-            if i < len(vec_docs):
-                doc = vec_docs[i]
-                if doc not in seen:
-                    combined_results.append(doc)
-                    seen.add(doc)
-            if i < len(bm25_docs):
-                doc = bm25_docs[i]
-                if doc not in seen:
-                    combined_results.append(doc)
-                    seen.add(doc)
-            
-            if len(combined_results) >= top_k:
-                break
-                
-        return combined_results[:top_k]
+        return combined[:top_k]
 
 if __name__ == "__main__":
-    # Test Ingestion and Search
     kb = HybridKnowledgeBase()
-    kb.ingest_rules()
-    
-    print("\n🔍 Testing Hybrid Search: 'Syn Flood'")
-    hits = kb.search("Many short lived TCP connections with SYN flag set")
-    for i, hit in enumerate(hits):
-        print(f"{i+1}. {hit[:100]}...")
+    kb.ingest_kb()

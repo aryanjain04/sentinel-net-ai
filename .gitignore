@@ -1,15 +1,18 @@
 # Python
 venv/
+.venv/
 __pycache__/
 *.pyc
 
 # PCAPs and local captures
 *.pcap
-sample.pcap
+
+# Generated model artifacts
+baseline_rf.joblib
 
 # Local env & secrets
 .env
-.env.example
+!.env.example
 
 # ChromaDB / vector DB persistence (DO NOT push)
 chroma_db/
@@ -17,9 +20,13 @@ chromadb/
 chroma.sqlite3
 chroma_db.sqlite3
 
+# Runtime outputs
+runs/
+sentinel_alerts.json
+
+# Temp files
+.tmp/
+
 # Editor / OS cruft
 .vscode/
 .DS_Store
-
-
-sample

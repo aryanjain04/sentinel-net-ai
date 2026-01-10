@@ -1,184 +1,169 @@
+"""Layer-3 LLM analysis for suspicious flows.
+
+This module intentionally supports two LLM modes:
+- Gemini (cloud) via GOOGLE_API_KEY
+- Ollama (local) via a running Ollama server
+
+If no LLM is configured, the analyzer still returns a structured, rule-backed
+result so the end-to-end demo works offline.
+"""
+
 import json
 import os
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
-import chromadb
-from dotenv import load_dotenv
 
-# Load environment variables (API Key)
+import joblib
+import pandas as pd
+from dotenv import load_dotenv
+from langchain_core.prompts import ChatPromptTemplate
+
+from vector_store import HybridKnowledgeBase
+
 load_dotenv()
 
 class TrafficAnalyzer:
-    def __init__(self, db_path="./chroma_db"):
-        """
-        Initialize the Analysis Engine.
-        1. Connects to the Vector Knowledge Base.
-        2. Initializes the Gemini Pro LLM.
-        """
-        # 1. Connect to Knowledge Base (ChromaDB)
-        self.chroma_client = chromadb.PersistentClient(path=db_path)
-        self.kb_collection = self.chroma_client.get_or_create_collection(name="knowledge_base")
+    def __init__(self, db_path="./chroma_db", model_path="baseline_rf.joblib"):
+        db_path = os.getenv("CHROMA_PATH", db_path)
+        model_path = os.getenv("MODEL_PATH", model_path)
 
-        # 2. Initialize LLM (Gemini 1.5 Pro via LangChain)
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            print("WARNING: GOOGLE_API_KEY not found in .env. LLM features will fail.")
-        
-        self.llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-pro", 
-            google_api_key=api_key,
-            temperature=0.1, # Low temperature for factual, consistent analysis
-            convert_system_message_to_human=True
-        )
+        if not os.path.exists(model_path):
+            from trainer import train_baseline
 
-        # 3. Define the Prompt Template (The "Brain" logic)
-        self.prompt_template = PromptTemplate(
-            input_variables=["flow_desc", "context"],
-            template="""
-            You are a Senior Cybersecurity Analyst (SOC Tier 3). 
-            Your job is to analyze network traffic flows and determine if they represent a security threat.
+            train_baseline(output_path=model_path)
+        self.ml_model = joblib.load(model_path)
+        self.kb = HybridKnowledgeBase(db_path=db_path)
+        self.kb.ensure_ingested()
 
-            ### OBSERVED TRAFFIC FLOW:
-            {flow_desc}
+        self.llm = self._build_llm()
 
-            ### RELEVANT EXPERT KNOWLEDGE (MITRE ATT&CK):
-            {context}
+    def _build_llm(self):
+        provider = (os.getenv("LLM_PROVIDER") or "gemini").strip().lower()
+        if provider == "gemini":
+            api_key = os.getenv("GOOGLE_API_KEY")
+            if not api_key:
+                return None
+            from langchain_google_genai import ChatGoogleGenerativeAI
 
-            ### ANALYSIS INSTRUCTIONS:
-            1. Compare the Observed Traffic against the Expert Knowledge.
-            2. Determine if the traffic matches any known attack signatures (like Port Scanning, DoS, C2).
-            3. Ignore common background noise (like standard DNS to 8.8.8.8 or HTTPS to known safe IPs).
-            4. Provide a Risk Score (0-100) where 0 is benign and 100 is critical.
+            requested = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
+            if requested.startswith("models/"):
+                requested = requested[len("models/") :]
+            alias_map = {
+                # Common shorthand / legacy names
+                "gemini-flash-2.0": "gemini-2.0-flash",
+                "gemini-2.0-flash": "gemini-2.0-flash",
+                "gemini-flash-latest": "gemini-flash-latest",
+                "gemini-pro-latest": "gemini-pro-latest",
+            }
+            model_name = alias_map.get(requested, requested)
 
-            ### OUTPUT FORMAT (STRICT JSON):
-            Return ONLY a valid JSON object. Do not include markdown formatting or explanations outside the JSON.
-            {{
-                "risk_score": <int>,
-                "classification": "<string: Benign | Suspicious | Malicious>",
-                "confidence": <string: Low | Medium | High>,
-                "reasoning": "<string: Detailed explanation of why you made this decision>",
-                "mitigation": "<string: Suggested action (e.g., Block IP, Inspect Payload)>"
-            }}
-            """
-        )
+            # Try requested model, then fall back to a widely available flash model.
+            fallback_candidates = [
+                model_name,
+                "gemini-2.0-flash",
+                "gemini-2.0-flash-001",
+                "gemini-flash-latest",
+                "gemini-2.0-flash-lite",
+                "gemini-flash-lite-latest",
+            ]
 
-        self.chain = self.prompt_template | self.llm
+            seen = set()
+            ordered = []
+            for c in fallback_candidates:
+                c = (c or "").strip()
+                if not c or c in seen:
+                    continue
+                seen.add(c)
+                ordered.append(c)
 
-    def _flow_to_text(self, flow):
-        """
-        Semantic Transformation: Converts a raw dictionary flow to a natural language story.
-        "Bridging the gap between Structured Data and Unstructured LLMs."
-        """
-        src = f"{flow.get('src_ip')}:{flow.get('src_port')}"
-        dst = f"{flow.get('dst_ip')}:{flow.get('dst_port')}"
-        
-        # Fix mismatch: parser.py sends 'proto' (int), we want text
-        proto_val = flow.get('protocol') or flow.get('proto')
-        proto_map = {6: 'TCP', 17: 'UDP', 1: 'ICMP'}
-        if isinstance(proto_val, int):
-            proto = proto_map.get(proto_val, str(proto_val))
-        else:
-            proto = str(proto_val) if proto_val else 'Unknown'
+            for candidate in ordered:
+                try:
+                    return ChatGoogleGenerativeAI(
+                        model=candidate,
+                        temperature=0,
+                        google_api_key=api_key,
+                    )
+                except Exception as e:
+                    msg = str(e)
+                    if "NOT_FOUND" in msg or "not found" in msg.lower() or "ListModels" in msg:
+                        continue
+                    # For non-model-availability errors (auth, network), don't hide the failure.
+                    raise
 
-        # Fix mismatch: parser.py sends 'flags' (str "S,A"), we want list
-        flags_val = flow.get('tcp_flags') or flow.get('flags')
-        flags = []
-        if isinstance(flags_val, list):
-            flags = flags_val
-        elif isinstance(flags_val, str) and flags_val:
-            flags = flags_val.split(',')
+            return None
 
-        pkts = flow.get('packet_count', 0)
-        bytes_ = flow.get('byte_count', 0)
-        duration = flow.get('duration', 0)
+        if provider == "ollama":
+            model = os.getenv("OLLAMA_MODEL", "llama3")
+            from langchain_community.chat_models import ChatOllama
 
+            return ChatOllama(model=model, temperature=0)
+
+        return None
+
+    def ml_bouncer(self, flow):
+        # Features: [duration, packet_count, byte_count, server_port, client_port]
+        features = {
+            "duration": float(flow.get("duration", 0.0) or 0.0),
+            "packet_count": float(flow.get("packet_count", 0) or 0),
+            "byte_count": float(flow.get("byte_count", 0) or 0),
+            "server_port": float(flow.get("server_port", 0) or 0),
+            "client_port": float(flow.get("client_port", 0) or 0),
+        }
+        X = pd.DataFrame([features])
+        return self.ml_model.predict(X)[0] == 1
+
+    def analyze_flow(self, flow):
         narrative = (
-            f"A {proto} connection from {src} to {dst}. "
-            f"Transferred {bytes_} bytes over {pkts} packets. "
-            f"Duration was {duration:.2f} seconds. "
+            f"Flow: {flow.get('src_ip')}:{flow.get('src_port')} -> {flow.get('dst_ip')}:{flow.get('dst_port')} "
+            f"proto={flow.get('proto')}. Duration={flow.get('duration')}s, Packets={flow.get('packet_count')}, "
+            f"Bytes={flow.get('byte_count')}, Flags={flow.get('tcp_flags')}."
         )
+        context_docs = self.kb.hybrid_search(narrative, top_k=2)
         
-        if flags:
-            narrative += f"TCP Flags observed: {', '.join(flags)}."
-        
-        # Heuristic hints for the LLM
-        if pkts > 100 and duration < 1:
-            narrative += " (High velocity traffic detected)."
-        if bytes_ == 0:
-            narrative += " (Zero payload data detected)."
-        
-        return narrative
+        prompt = ChatPromptTemplate.from_messages([
+            (
+                "system",
+                """You are a Senior SOC Analyst.
+Use the provided MITRE technique context (if any) to interpret the network flow.
+Return ONLY valid JSON (no markdown), with keys:
+- classification (Benign|Suspicious|Malicious)
+- confidence (0-1)
+- mitre_techniques (list of strings)
+- reasoning (short string)
+- recommended_actions (list of strings)""",
+            ),
+            ("human", "MITRE Context (may be empty):\n{context}\n\nFlow Data:\n{flow_info}")
+        ])
 
-    def analyze_flow(self, flow_data):
-        """
-        The Core RAG Pipeline:
-        1. Narrative Generation (Data -> Text)
-        2. Retrieval (Text -> Context)
-        3. Augmented Generation (Text + Context -> Analysis)
-        """
-        # Step 1: Narrative Generation
-        flow_narrative = self._flow_to_text(flow_data)
-        
-        # Step 2: Context Retrieval (RAG)
-        # Query ChromaDB for the 2 most similar attack descriptions
-        results = self.kb_collection.query(
-            query_texts=[flow_narrative],
-            n_results=2
-        )
-        
-        # Extract meaningful context texts
-        if results and results['documents']:
-            context_text = "\n".join(results['documents'][0])
-        else:
-            context_text = "No specific MITRE technique matched strongly."
-
-        # Step 3: LLM Inference
-        try:
-            response_msg = self.chain.invoke({
-                "flow_desc": flow_narrative,
-                "context": context_text
-            })
-            
-            # Parse the response content (it comes as an AIMessage object)
-            response_text = response_msg.content.strip()
-            
-            # Clean up potential markdown formatting if the model slipped up
-            response_text = response_text.replace("```json", "").replace("```", "")
-            
-            analysis_json = json.loads(response_text)
-            
-            # Add metadata back to the result for the dashboard
-            analysis_json['flow_id'] = f"{flow_data.get('src_ip')}->{flow_data.get('dst_ip')}"
-            return analysis_json
-
-        except Exception as e:
+        # Offline fallback: still produce a useful, structured result.
+        if self.llm is None:
             return {
-                "risk_score": 0,
-                "classification": "Error",
-                "reasoning": f"Analysis failed: {str(e)}",
-                "mitigation": "Check logs"
+                "classification": "Suspicious",
+                "confidence": 0.5,
+                "mitre_techniques": [],
+                "reasoning": "No LLM configured. Returned rule-backed fallback.",
+                "recommended_actions": [
+                    "Validate whether the destination port/service is expected",
+                    "Check source host for recent process/network anomalies",
+                    "Correlate with DNS/HTTP logs if available",
+                ],
+                "context_used": context_docs,
             }
 
-if __name__ == "__main__":
-    # Test Block
-    print("Initializing Analyzer...")
-    analyzer = TrafficAnalyzer()
-    
-    # Test File: Simulating a "Port Scan" flow
-    # (High packets, zero bytes, short duration, SYN flag)
-    test_flow = {
-        "src_ip": "192.168.1.105",
-        "src_port": 4444,
-        "dst_ip": "10.0.0.1",
-        "dst_port": 80,
-        "protocol": "TCP",
-        "packet_count": 50,
-        "byte_count": 0,
-        "duration": 0.5,
-        "tcp_flags": ["SYN"]
-    }
-    
-    print("\nRunning Test Analysis...")
-    result = analyzer.analyze_flow(test_flow)
-    print(json.dumps(result, indent=2))
+        try:
+            response = (prompt | self.llm).invoke({"flow_info": narrative, "context": "\n".join(context_docs)})
+            content = (response.content or "").strip()
+            # Defensive cleanup for models that still wrap JSON.
+            content = content.replace("```json", "").replace("```", "").strip()
+            return json.loads(content)
+        except Exception as e:
+            return {
+                "classification": "Suspicious",
+                "confidence": 0.3,
+                "mitre_techniques": [],
+                "reasoning": f"LLM request failed: {str(e)}",
+                "recommended_actions": [
+                    "Verify whether this connection is expected",
+                    "Check endpoint process/network telemetry",
+                    "Correlate with DNS/HTTP logs if available",
+                ],
+                "context_used": context_docs,
+            }

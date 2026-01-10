@@ -1,6 +1,29 @@
+# --- Networking & Data Processing ---
 scapy
 pandas
+numpy
+
+# --- Machine Learning Baseline (Layer 2) ---
+scikit-learn
+joblib
+
+# --- Vector Database & RAG (Layer 3) ---
 chromadb
+sentence-transformers
+rank_bm25
+tqdm
+
+# --- LLM & Orchestration ---
 langchain
+langchain-community
+langchain-core
 langchain-google-genai
+google-generativeai
 python-dotenv
+
+# --- UI / Demo ---
+streamlit
+altair
+
+# --- Optional (requires tshark installed) ---
+pyshark
