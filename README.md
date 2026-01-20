@@ -50,12 +50,6 @@ Outputs are stored under `runs/<timestamp>/`:
 
 Upload a PCAP and review the top suspicious flows + LLM JSON results.
 
-## Limitations (Intentional)
-
-- No deep packet inspection (DPI), protocol parsing, or TLS decryption
-- ML baseline is synthetic and used for gating/demo purposes
-- Not a production IDS
-
 ## Configuration
 
 Environment variables (copy `.env.example` → `.env`):
